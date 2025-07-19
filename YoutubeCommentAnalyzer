@@ -1,0 +1,1085 @@
+#!/usr/bin/env python3
+"""
+YouTube Comment Analyzer
+AI-powered system to detect spam/bot comments and analyze engagement patterns
+"""
+
+from flask import Flask, render_template_string, request, jsonify
+import numpy as np
+import pandas as pd
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, accuracy_score
+import re
+from datetime import datetime, timedelta
+import random
+import string
+import warnings
+
+warnings.filterwarnings('ignore')
+
+app = Flask(__name__)
+
+# Global model components
+spam_detector = None
+engagement_analyzer = None
+vectorizer_spam = None
+vectorizer_engagement = None
+models_trained = False
+
+# YouTube-specific spam patterns
+SPAM_INDICATORS = {
+    'bot_phrases': ['first', 'early', 'notification squad', 'love your videos', 'great content', 'keep it up'],
+    'promotional': ['check out my channel', 'subscribe to me', 'follow me', 'my channel', 'link in bio'],
+    'engagement_bait': ['like if you', 'comment if you', 'who else', 'anyone else', 'am i the only one'],
+    'generic_praise': ['amazing', 'awesome', 'incredible', 'fantastic', 'love this', 'so good'],
+    'spam_chars': ['💯', '🔥', '👇', '👆', '⬇️', '⬆️', '💪', '🙌'],
+    'scam_words': ['free', 'win', 'giveaway', 'contest', 'prize', 'click here', 'link below']
+}
+
+# Engagement quality indicators
+ENGAGEMENT_PATTERNS = {
+    'thoughtful': ['because', 'however', 'actually', 'personally', 'in my opinion', 'i think', 'explains'],
+    'questions': ['why', 'how', 'what', 'when', 'where', 'which', 'could you'],
+    'specific': ['timestamp', 'at', 'minute', 'part where', 'scene', 'moment', 'section'],
+    'discussion': ['agree', 'disagree', 'interesting point', 'good point', 'makes sense', 'you\'re right']
+}
+
+
+def generate_spam_comment():
+    """Generate synthetic spam/bot comment patterns"""
+    templates = [
+        "First! {praise} video! {emoji}",
+        "{praise}! {bot_phrase}! {emoji}{emoji}",
+        "{praise} content! {engagement_bait}? {emoji}",
+        "Love this! {promotional}! {emoji}",
+        "{engagement_bait}? {praise}! {spam_chars}",
+        "Early! {bot_phrase}! {praise}! {emoji}",
+        "{scam} {promotional} {emoji}{emoji}{emoji}",
+        "OMG {praise}! {engagement_bait}? {emoji}"
+    ]
+
+    template = random.choice(templates)
+    comment = template.format(
+        praise=random.choice(SPAM_INDICATORS['generic_praise']),
+        bot_phrase=random.choice(SPAM_INDICATORS['bot_phrases']),
+        engagement_bait=random.choice(SPAM_INDICATORS['engagement_bait']),
+        promotional=random.choice(SPAM_INDICATORS['promotional']),
+        spam_chars=random.choice(SPAM_INDICATORS['spam_chars']),
+        scam=random.choice(SPAM_INDICATORS['scam_words']),
+        emoji=''.join(random.choices(['😍', '🔥', '💯', '👍', '❤️'], k=random.randint(1, 3)))
+    )
+
+    # Determine engagement quality
+    if any(word in comment.lower() for word in SPAM_INDICATORS['promotional']):
+        engagement = 'low'
+    elif any(word in comment.lower() for word in SPAM_INDICATORS['engagement_bait']):
+        engagement = 'medium'
+    else:
+        engagement = 'low'
+
+    return comment, engagement
+
+
+def generate_authentic_comment():
+    """Generate synthetic authentic comment patterns"""
+    templates = [
+        "This {specific_detail} really {opinion}. {explanation}",
+        "Great point about {topic}. I {personal_experience}",
+        "The part at {timestamp} was {opinion}. {thoughtful_addition}",
+        "I {agree_disagree} with this because {reasoning}",
+        "Thanks for explaining {topic}. {question}?",
+        "Been {experience} and this {opinion}. {personal_detail}",
+        "Your point about {topic} {opinion}. {discussion_point}",
+        "This reminds me of {reference}. {thoughtful_connection}"
+    ]
+
+    specific_details = ['explanation', 'breakdown', 'analysis', 'tutorial', 'review', 'demonstration']
+    opinions = ['makes sense', 'was helpful', 'changed my perspective', 'was interesting', 'was confusing']
+    explanations = ['Never thought about it that way', 'Really opened my eyes', 'Going to try this approach']
+    topics = ['the editing', 'the research', 'this topic', 'the method', 'the technique']
+    experiences = ['working in this field', 'dealing with this', 'studying this']
+    timestamps = ['2:30', '5:45', '1:20', '3:15', '7:00']
+
+    template = random.choice(templates)
+    comment = template.format(
+        specific_detail=random.choice(specific_details),
+        opinion=random.choice(opinions),
+        explanation=random.choice(explanations),
+        topic=random.choice(topics),
+        personal_experience=random.choice(
+            ['have similar experience', 'learned this the hard way', 'tried this before']),
+        timestamp=random.choice(timestamps),
+        thoughtful_addition=random.choice(['Thanks for sharing', 'Keep up the good work', 'Very informative']),
+        agree_disagree=random.choice(['agree', 'partially agree', 'disagree']),
+        reasoning=random.choice(['of my experience', 'the data shows', 'it worked differently for me']),
+        question=random.choice(['How long did this take', 'What software did you use', 'Any tips for beginners']),
+        experience=random.choice(experiences),
+        personal_detail=random.choice(['saved me hours', 'exactly what I needed', 'wish I knew this earlier']),
+        discussion_point=random.choice(ENGAGEMENT_PATTERNS['discussion']),
+        reference=random.choice(['a project I worked on', 'something I read', 'a similar situation']),
+        thoughtful_connection=random.choice(['Interesting parallel', 'Similar principles apply', 'Good connection'])
+    )
+
+    # Determine engagement quality based on content
+    if any(word in comment.lower() for word in ENGAGEMENT_PATTERNS['thoughtful']):
+        engagement = 'high'
+    elif any(word in comment.lower() for word in ENGAGEMENT_PATTERNS['questions']):
+        engagement = 'high'
+    elif any(word in comment.lower() for word in ENGAGEMENT_PATTERNS['specific']):
+        engagement = 'medium'
+    else:
+        engagement = 'medium'
+
+    return comment, engagement
+
+
+def extract_youtube_features(text):
+    """Extract features specific to YouTube comment patterns"""
+    features = {}
+
+    # Basic text statistics
+    features['length'] = len(text)
+    features['word_count'] = len(text.split())
+    features['avg_word_length'] = np.mean([len(word) for word in text.split()]) if text.split() else 0
+    features['exclamation_count'] = text.count('!')
+    features['caps_ratio'] = sum(1 for c in text if c.isupper()) / len(text) if text else 0
+
+    # YouTube-specific patterns
+    text_lower = text.lower()
+    features['bot_phrases'] = sum(1 for phrase in SPAM_INDICATORS['bot_phrases'] if phrase in text_lower)
+    features['promotional_words'] = sum(1 for phrase in SPAM_INDICATORS['promotional'] if phrase in text_lower)
+    features['engagement_bait'] = sum(1 for phrase in SPAM_INDICATORS['engagement_bait'] if phrase in text_lower)
+    features['generic_praise'] = sum(1 for word in SPAM_INDICATORS['generic_praise'] if word in text_lower)
+    features['scam_words'] = sum(1 for word in SPAM_INDICATORS['scam_words'] if word in text_lower)
+
+    # Emoji and special character patterns
+    emoji_pattern = re.compile(
+        r'[\U0001F600-\U0001F64F\U0001F300-\U0001F5FF\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF\U00002700-\U000027BF]')
+    features['emoji_count'] = len(emoji_pattern.findall(text))
+    features['repeated_chars'] = len(re.findall(r'(.)\1{2,}', text_lower))
+
+    # Engagement quality indicators
+    features['thoughtful_words'] = sum(1 for word in ENGAGEMENT_PATTERNS['thoughtful'] if word in text_lower)
+    features['questions'] = sum(1 for word in ENGAGEMENT_PATTERNS['questions'] if word in text_lower)
+    features['specific_references'] = sum(1 for word in ENGAGEMENT_PATTERNS['specific'] if word in text_lower)
+    features['discussion_words'] = sum(1 for word in ENGAGEMENT_PATTERNS['discussion'] if word in text_lower)
+
+    # Timestamp detection (indicates engagement with content)
+    timestamp_pattern = r'\b\d{1,2}:\d{2}\b'
+    features['has_timestamp'] = 1 if re.search(timestamp_pattern, text) else 0
+
+    # First comment indicators
+    features['is_first_claim'] = 1 if any(word in text_lower for word in ['first', 'early', 'notification']) else 0
+
+    return features
+
+
+def generate_training_data():
+    """Generate training data for YouTube comment analysis"""
+    data = []
+
+    print("Generating YouTube comment training data...")
+
+    # Generate spam/bot comments (35% of dataset)
+    for _ in range(350):
+        comment, engagement = generate_spam_comment()
+        features = extract_youtube_features(comment)
+        data.append({
+            'comment': comment,
+            'is_spam': 1,
+            'engagement_quality': engagement,
+            **features
+        })
+
+    # Generate authentic comments (65% of dataset)
+    for _ in range(650):
+        comment, engagement = generate_authentic_comment()
+        features = extract_youtube_features(comment)
+        data.append({
+            'comment': comment,
+            'is_spam': 0,
+            'engagement_quality': engagement,
+            **features
+        })
+
+    return pd.DataFrame(data)
+
+
+def train_models():
+    """Train spam detection and engagement quality models"""
+    global spam_detector, engagement_analyzer, vectorizer_spam, vectorizer_engagement, models_trained
+
+    # Generate training data
+    df = generate_training_data()
+
+    # Train spam detector
+    print("Training spam/bot detector...")
+    vectorizer_spam = TfidfVectorizer(max_features=1000, stop_words='english', ngram_range=(1, 2))
+    X_text = vectorizer_spam.fit_transform(df['comment'])
+
+    # Combine text features with YouTube-specific features
+    feature_cols = ['length', 'word_count', 'avg_word_length', 'exclamation_count', 'caps_ratio',
+                    'bot_phrases', 'promotional_words', 'engagement_bait', 'generic_praise', 'scam_words',
+                    'emoji_count', 'repeated_chars', 'thoughtful_words', 'questions', 'specific_references',
+                    'discussion_words', 'has_timestamp', 'is_first_claim']
+    X_features = df[feature_cols].values
+    X_combined = np.hstack([X_text.toarray(), X_features])
+
+    y_spam = df['is_spam']
+
+    spam_detector = GradientBoostingClassifier(n_estimators=100, random_state=42)
+    spam_detector.fit(X_combined, y_spam)
+
+    # Train engagement quality analyzer
+    print("Training engagement quality analyzer...")
+    vectorizer_engagement = TfidfVectorizer(max_features=800, stop_words='english')
+    X_engagement = vectorizer_engagement.fit_transform(df['comment'])
+    y_engagement = df['engagement_quality']
+
+    engagement_analyzer = LogisticRegression(random_state=42)
+    engagement_analyzer.fit(X_engagement, y_engagement)
+
+    models_trained = True
+
+    # Print model performance
+    X_train, X_test, y_train, y_test = train_test_split(X_combined, y_spam, test_size=0.2, random_state=42)
+    spam_test = GradientBoostingClassifier(n_estimators=100, random_state=42)
+    spam_test.fit(X_train, y_train)
+    y_pred = spam_test.predict(X_test)
+    print(f"Spam Detection Accuracy: {accuracy_score(y_test, y_pred):.3f}")
+
+    X_train_eng, X_test_eng, y_train_eng, y_test_eng = train_test_split(X_engagement, y_engagement, test_size=0.2,
+                                                                        random_state=42)
+    engagement_test = LogisticRegression(random_state=42)
+    engagement_test.fit(X_train_eng, y_train_eng)
+    y_pred_eng = engagement_test.predict(X_test_eng)
+    print(f"Engagement Quality Accuracy: {accuracy_score(y_test_eng, y_pred_eng):.3f}")
+
+
+def analyze_comment(comment_text):
+    """Analyze a single YouTube comment for spam and engagement quality"""
+    global spam_detector, engagement_analyzer, vectorizer_spam, vectorizer_engagement, models_trained
+
+    if not models_trained:
+        return {"error": "Models not trained yet"}
+
+    # Extract features
+    features = extract_youtube_features(comment_text)
+
+    # Spam detection
+    X_text = vectorizer_spam.transform([comment_text])
+    feature_values = [features[col] for col in
+                      ['length', 'word_count', 'avg_word_length', 'exclamation_count', 'caps_ratio',
+                       'bot_phrases', 'promotional_words', 'engagement_bait', 'generic_praise', 'scam_words',
+                       'emoji_count', 'repeated_chars', 'thoughtful_words', 'questions', 'specific_references',
+                       'discussion_words', 'has_timestamp', 'is_first_claim']]
+    X_combined = np.hstack([X_text.toarray(), [feature_values]])
+
+    spam_prob = spam_detector.predict_proba(X_combined)[0][1]
+    is_spam_pred = spam_detector.predict(X_combined)[0]
+
+    # Engagement quality analysis
+    X_engagement = vectorizer_engagement.transform([comment_text])
+    engagement_pred = engagement_analyzer.predict(X_engagement)[0]
+    engagement_probs = engagement_analyzer.predict_proba(X_engagement)[0]
+    engagement_confidence = max(engagement_probs)
+
+    # Generate insights
+    insights = []
+    warnings = []
+
+    if features['bot_phrases'] > 0:
+        warnings.append("🤖 Contains typical bot phrases")
+    if features['promotional_words'] > 0:
+        warnings.append("📢 Self-promotional content detected")
+    if features['engagement_bait'] > 0:
+        warnings.append("🎣 Engagement bait patterns")
+    if features['is_first_claim'] > 0:
+        warnings.append("🥇 Claims to be first/early")
+    if features['emoji_count'] > 3:
+        warnings.append("😵 Excessive emoji usage")
+    if features['scam_words'] > 0:
+        warnings.append("⚠️ Potential scam indicators")
+
+    # Positive indicators
+    if features['thoughtful_words'] > 0:
+        insights.append("💭 Shows thoughtful engagement")
+    if features['questions'] > 0:
+        insights.append("❓ Asks relevant questions")
+    if features['has_timestamp'] > 0:
+        insights.append("⏰ References specific video moments")
+    if features['specific_references'] > 0:
+        insights.append("🎯 Makes specific content references")
+    if features['discussion_words'] > 0:
+        insights.append("💬 Engages in discussion")
+
+    if not insights and not warnings:
+        insights.append("📝 Standard comment pattern")
+
+    # Determine spam classification
+    if spam_prob < 0.3:
+        spam_status = "Likely Authentic"
+        spam_color = "green"
+    elif spam_prob < 0.7:
+        spam_status = "Questionable"
+        spam_color = "orange"
+    else:
+        spam_status = "Likely Spam/Bot"
+        spam_color = "red"
+
+    # Engagement quality description
+    engagement_descriptions = {
+        'high': 'High engagement - thoughtful interaction',
+        'medium': 'Medium engagement - basic interaction',
+        'low': 'Low engagement - minimal value'
+    }
+
+    return {
+        "spam_status": spam_status,
+        "spam_probability": round(spam_prob, 3),
+        "spam_color": spam_color,
+        "engagement_quality": engagement_pred.title(),
+        "engagement_description": engagement_descriptions.get(engagement_pred, 'Unknown'),
+        "engagement_confidence": round(engagement_confidence, 3),
+        "insights": insights,
+        "warnings": warnings,
+        "features": {
+            "word_count": features['word_count'],
+            "emoji_count": features['emoji_count'],
+            "bot_phrases": features['bot_phrases'],
+            "promotional_words": features['promotional_words'],
+            "has_timestamp": features['has_timestamp']
+        }
+    }
+
+
+def analyze_video_comments(comments):
+    """Analyze multiple comments for video-level insights"""
+    if not comments:
+        return {"error": "No comments provided"}
+
+    results = []
+    for comment in comments:
+        result = analyze_comment(comment['text'])
+        result['likes'] = comment.get('likes', 0)
+        result['timestamp'] = comment.get('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M'))
+        results.append(result)
+
+    # Calculate aggregate metrics
+    total_comments = len(results)
+    spam_count = sum(1 for r in results if r['spam_status'] == 'Likely Spam/Bot')
+    spam_percentage = (spam_count / total_comments) * 100
+
+    engagement_counts = {}
+    for r in results:
+        quality = r['engagement_quality']
+        engagement_counts[quality] = engagement_counts.get(quality, 0) + 1
+
+    # Video health insights
+    health_insights = []
+    if spam_percentage > 40:
+        health_insights.append("🚨 High spam activity - consider comment moderation")
+    elif spam_percentage > 20:
+        health_insights.append("⚠️ Moderate spam detected")
+    else:
+        health_insights.append("✅ Low spam levels")
+
+    high_engagement_ratio = engagement_counts.get('High', 0) / total_comments
+    if high_engagement_ratio > 0.5:
+        health_insights.append("🎉 Strong audience engagement")
+    elif high_engagement_ratio < 0.2:
+        health_insights.append("📉 Low quality engagement")
+
+    # Check for bot patterns
+    promotional_count = sum(
+        1 for r in results if len(r['warnings']) > 0 and any('promotional' in w.lower() for w in r['warnings']))
+    if promotional_count > total_comments * 0.15:
+        health_insights.append("🤖 Potential bot swarm detected")
+
+    return {
+        "total_comments": total_comments,
+        "spam_percentage": round(spam_percentage, 1),
+        "engagement_distribution": engagement_counts,
+        "health_insights": health_insights,
+        "individual_results": results
+    }
+
+
+# HTML Template for YouTube Comment Analyzer
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>YouTube Comment Analyzer</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: #333;
+            min-height: 100vh;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 16px;
+            box-shadow: 0 8px 32px rgba(0,0,0,0.1);
+            margin-bottom: 20px;
+        }
+        h1 {
+            color: #2c3e50;
+            text-align: center;
+            margin-bottom: 10px;
+            font-size: 2.5em;
+        }
+        .subtitle {
+            text-align: center;
+            color: #7f8c8d;
+            margin-bottom: 30px;
+            font-style: italic;
+            font-size: 1.1em;
+        }
+        .youtube-header {
+            background: linear-gradient(90deg, #ff0000, #cc0000);
+            color: white;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            text-align: center;
+            font-weight: bold;
+        }
+        .tabs {
+            display: flex;
+            margin-bottom: 20px;
+            border-bottom: 2px solid #ecf0f1;
+            background: #f8f9fa;
+            border-radius: 8px 8px 0 0;
+        }
+        .tab {
+            padding: 15px 25px;
+            cursor: pointer;
+            border: none;
+            background: none;
+            font-size: 16px;
+            color: #7f8c8d;
+            border-bottom: 3px solid transparent;
+            transition: all 0.3s;
+        }
+        .tab.active {
+            color: #ff0000;
+            border-bottom-color: #ff0000;
+            background: white;
+        }
+        .tab:hover {
+            background: #f1f2f6;
+        }
+        .tab-content {
+            display: none;
+        }
+        .tab-content.active {
+            display: block;
+        }
+        .form-group {
+            margin-bottom: 20px;
+        }
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: bold;
+            color: #34495e;
+        }
+        textarea, input {
+            width: 100%;
+            padding: 15px;
+            border: 2px solid #ddd;
+            border-radius: 10px;
+            font-size: 14px;
+            box-sizing: border-box;
+            font-family: inherit;
+            transition: border-color 0.3s;
+        }
+        textarea {
+            min-height: 120px;
+            resize: vertical;
+        }
+        textarea:focus, input:focus {
+            border-color: #ff0000;
+            outline: none;
+            box-shadow: 0 0 0 3px rgba(255, 0, 0, 0.1);
+        }
+        .btn {
+            background: linear-gradient(45deg, #ff0000, #cc0000);
+            color: white;
+            padding: 15px 30px;
+            border: none;
+            border-radius: 10px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: all 0.3s;
+            font-weight: bold;
+        }
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(255, 0, 0, 0.3);
+        }
+        .btn:disabled {
+            background: #bdc3c7;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .results {
+            margin-top: 30px;
+            display: none;
+        }
+        .result-card {
+            background: #f8f9fa;
+            padding: 25px;
+            border-radius: 12px;
+            margin-bottom: 15px;
+            border-left: 5px solid #3498db;
+            transition: transform 0.2s;
+        }
+        .result-card:hover {
+            transform: translateY(-2px);
+        }
+        .result-card.spam {
+            border-left-color: #e74c3c;
+            background: linear-gradient(135deg, #fdf2f2, #fef5f5);
+        }
+        .result-card.questionable {
+            border-left-color: #f39c12;
+            background: linear-gradient(135deg, #fef9e7, #fffbf0);
+        }
+        .result-card.authentic {
+            border-left-color: #27ae60;
+            background: linear-gradient(135deg, #f0f8f0, #f8fff8);
+        }
+        .score {
+            font-size: 24px;
+            font-weight: bold;
+            margin: 10px 0;
+        }
+        .engagement-badge {
+            display: inline-block;
+            padding: 8px 16px;
+            border-radius: 25px;
+            font-weight: bold;
+            margin: 5px 5px 5px 0;
+        }
+        .engagement-badge.high {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .engagement-badge.medium {
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeeba;
+        }
+        .engagement-badge.low {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .insights {
+            margin-top: 15px;
+        }
+        .insights ul {
+            margin: 10px 0;
+            padding-left: 20px;
+        }
+        .insights li {
+            margin: 8px 0;
+            padding: 5px 0;
+        }
+        .warning {
+            color: #e74c3c;
+        }
+        .positive {
+            color: #27ae60;
+        }
+        .loading {
+            text-align: center;
+            color: #7f8c8d;
+            display: none;
+            padding: 20px;
+        }
+        .video-metrics {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        .metric-card {
+            background: linear-gradient(135deg, #667eea, #764ba2);
+            color: white;
+            padding: 20px;
+            border-radius: 12px;
+            text-align: center;
+        }
+        .metric-value {
+            font-size: 32px;
+            font-weight: bold;
+        }
+        .metric-label {
+            font-size: 14px;
+            opacity: 0.9;
+        }
+        .comment-input {
+            margin-bottom: 15px;
+            padding: 20px;
+            background: #f8f9fa;
+            border-radius: 12px;
+            border: 1px solid #e9ecef;
+        }
+        .add-comment-btn {
+            background: linear-gradient(45deg, #27ae60, #2ecc71);
+            margin-bottom: 10px;
+        }
+        .add-comment-btn:hover {
+            box-shadow: 0 5px 15px rgba(39, 174, 96, 0.3);
+        }
+        .examples {
+            margin-top: 20px;
+            padding: 20px;
+            background: linear-gradient(135deg, #f8f9fa, #e9ecef);
+            border-radius: 12px;
+        }
+        .example-comment {
+            background: white;
+            padding: 15px;
+            margin: 10px 0;
+            border-radius: 8px;
+            cursor: pointer;
+            border: 2px solid transparent;
+            transition: all 0.3s;
+        }
+        .example-comment:hover {
+            border-color: #ff0000;
+            transform: translateY(-2px);
+        }
+        .example-spam {
+            border-left: 4px solid #e74c3c;
+        }
+        .example-authentic {
+            border-left: 4px solid #27ae60;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="youtube-header">
+            🎥 YouTube Comment Analyzer
+        </div>
+        <h1>AI-Powered Comment Analysis</h1>
+        <p class="subtitle">Detect spam, bots, and analyze engagement quality in YouTube comments</p>
+
+        <div class="tabs">
+            <button class="tab active" onclick="switchTab('single')">📝 Single Comment</button>
+            <button class="tab" onclick="switchTab('video')">🎬 Video Analysis</button>
+        </div>
+
+        <!-- Single Comment Tab -->
+        <div class="tab-content active" id="single-tab">
+            <form id="singleCommentForm">
+                <div class="form-group">
+                    <label for="commentText">YouTube Comment:</label>
+                    <textarea id="commentText" name="commentText" placeholder="Paste a YouTube comment here to analyze..." required></textarea>
+                </div>
+                <button type="submit" class="btn">🔍 Analyze Comment</button>
+                <button type="button" class="btn" onclick="testDisplay()" style="background: #27ae60; margin-left: 10px;">🧪 Test Display</button>
+            </form>
+
+            <div class="examples">
+                <strong>🧪 Try these examples:</strong>
+                <div class="example-comment example-spam" onclick="setExample('First! Amazing video! Love your content! 🔥🔥🔥 Check out my channel too!')">
+                    🤖 Spam Example: "First! Amazing video! Love your content! 🔥🔥🔥 Check out my channel too!"
+                </div>
+                <div class="example-comment example-authentic" onclick="setExample('Great explanation at 3:45 about the algorithm changes. This actually helped me understand why my videos weren\\'t performing well. Thanks!')">
+                    ✅ Authentic Example: "Great explanation at 3:45 about the algorithm changes. This actually helped me understand..."
+                </div>
+                <div class="example-comment example-spam" onclick="setExample('OMG amazing! Like if you agree! Who else loves this creator? 💯💯💯')">
+                    🎣 Engagement Bait: "OMG amazing! Like if you agree! Who else loves this creator? 💯💯💯"
+                </div>
+                <div class="example-comment example-authentic" onclick="setExample('I disagree with your point about mobile optimization. In my experience working with small businesses, desktop still drives more conversions. What data are you basing this on?')">
+                    💭 Thoughtful Discussion: "I disagree with your point about mobile optimization. In my experience..."
+                </div>
+            </div>
+        </div>
+
+        <!-- Video Analysis Tab -->
+        <div class="tab-content" id="video-tab">
+            <div id="commentInputs">
+                <div class="comment-input">
+                    <label>Comment 1:</label>
+                    <textarea class="video-comment" placeholder="Enter YouTube comment..."></textarea>
+                    <input type="number" class="comment-likes" placeholder="Likes (optional)" min="0">
+                </div>
+            </div>
+            <button type="button" class="btn add-comment-btn" onclick="addCommentInput()">➕ Add Another Comment</button>
+            <button type="button" class="btn" onclick="analyzeVideoComments()">📊 Analyze Video Comments</button>
+        </div>
+
+        <div class="loading" id="loading">
+            🤖 AI is analyzing comments...
+        </div>
+
+        <div class="results" id="results"></div>
+    </div>
+
+    <script>
+        function switchTab(tabName) {
+            // Update tab buttons
+            document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
+            event.target.classList.add('active');
+
+            // Update tab content
+            document.querySelectorAll('.tab-content').forEach(content => content.classList.remove('active'));
+            document.getElementById(tabName + '-tab').classList.add('active');
+
+            // Clear results
+            document.getElementById('results').style.display = 'none';
+        }
+
+        function setExample(text) {
+            document.getElementById('commentText').value = text;
+        }
+
+        function addCommentInput() {
+            const container = document.getElementById('commentInputs');
+            const count = container.children.length + 1;
+            const div = document.createElement('div');
+            div.className = 'comment-input';
+            div.innerHTML = `
+                <label>Comment ${count}:</label>
+                <textarea class="video-comment" placeholder="Enter YouTube comment..."></textarea>
+                <input type="number" class="comment-likes" placeholder="Likes (optional)" min="0">
+            `;
+            container.appendChild(div);
+        }
+
+        document.getElementById('singleCommentForm').addEventListener('submit', async function(e) {
+            e.preventDefault();
+
+            const commentText = document.getElementById('commentText').value;
+            if (!commentText.trim()) return;
+
+            showLoading();
+
+            try {
+                const response = await fetch('/analyze-comment', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ comment: commentText })
+                });
+
+                console.log('Response status:', response.status);
+                const result = await response.json();
+                console.log('Response data:', result);
+
+                // Quick test - show alert with result
+                alert('Got response: ' + JSON.stringify(result, null, 2));
+
+                displaySingleResult(result);
+
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Error analyzing comment. Please try again.');
+            } finally {
+                hideLoading();
+            }
+        });
+
+        async function analyzeVideoComments() {
+            const commentElements = document.querySelectorAll('.video-comment');
+            const likesElements = document.querySelectorAll('.comment-likes');
+
+            const comments = [];
+            for (let i = 0; i < commentElements.length; i++) {
+                const text = commentElements[i].value.trim();
+                if (text) {
+                    comments.push({
+                        text: text,
+                        likes: parseInt(likesElements[i].value) || 0
+                    });
+                }
+            }
+
+            if (comments.length === 0) {
+                alert('Please enter at least one comment.');
+                return;
+            }
+
+            showLoading();
+
+            try {
+                const response = await fetch('/analyze-video', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ comments: comments })
+                });
+
+                const result = await response.json();
+                displayVideoResults(result);
+
+            } catch (error) {
+                console.error('Error:', error);
+                alert('Error analyzing comments. Please try again.');
+            } finally {
+                hideLoading();
+            }
+        }
+
+        function showLoading() {
+            document.getElementById('loading').style.display = 'block';
+            document.getElementById('results').style.display = 'none';
+        }
+
+        function hideLoading() {
+            document.getElementById('loading').style.display = 'none';
+        }
+
+        // Test function - add this temporarily
+        function testDisplay() {
+            const testResult = {
+                spam_status: "Likely Authentic",
+                spam_probability: 0.2,
+                engagement_quality: "High",
+                engagement_description: "High engagement - thoughtful interaction",
+                engagement_confidence: 0.85,
+                insights: ["✅ Natural language patterns", "💭 Shows thoughtful engagement"],
+                warnings: ["⚠️ Test warning"],
+                features: {
+                    word_count: 10,
+                    emoji_count: 0,
+                    bot_phrases: 0,
+                    promotional_words: 0,
+                    has_timestamp: 0
+                }
+            };
+            displaySingleResult(testResult);
+        }
+
+        function displaySingleResult(result) {
+            console.log('Displaying result:', result); // Debug line
+
+            const resultsDiv = document.getElementById('results');
+
+            if (!result) {
+                console.error('No result to display');
+                return;
+            }
+
+            // Handle error responses
+            if (result.error) {
+                resultsDiv.innerHTML = `
+                    <div class="result-card spam">
+                        <h3>❌ Error</h3>
+                        <p>${result.error}</p>
+                    </div>
+                `;
+                resultsDiv.style.display = 'block';
+                return;
+            }
+
+            // Ensure all required properties exist with defaults
+            const spam_status = result.spam_status || 'Unknown';
+            const spam_probability = result.spam_probability || 0;
+            const engagement_quality = result.engagement_quality || 'Unknown';
+            const engagement_description = result.engagement_description || 'No description';
+            const engagement_confidence = result.engagement_confidence || 0;
+            const insights = result.insights || [];
+            const warnings = result.warnings || [];
+            const features = result.features || {};
+
+            const spamClass = spam_status.toLowerCase().replace(/[^a-z]/g, '-');
+
+            const warningsList = warnings.length > 0 ? 
+                `<strong>⚠️ Warning Signs:</strong><ul class="warning">${warnings.map(w => `<li>${w}</li>`).join('')}</ul>` : '';
+
+            const insightsList = insights.length > 0 ? 
+                `<strong>✅ Positive Indicators:</strong><ul class="positive">${insights.map(i => `<li>${i}</li>`).join('')}</ul>` : '';
+
+            resultsDiv.innerHTML = `
+                <div class="result-card ${spamClass}">
+                    <h3>🎯 Comment Analysis Results</h3>
+                    <div class="score">
+                        Spam Detection: ${spam_status} (${Math.round((1-spam_probability) * 100)}% authentic)
+                    </div>
+                    <div class="engagement-badge ${engagement_quality.toLowerCase()}">
+                        ${engagement_quality} Engagement Quality
+                    </div>
+                    <p><strong>Engagement:</strong> ${engagement_description} (${Math.round(engagement_confidence * 100)}% confidence)</p>
+
+                    <div class="insights">
+                        ${warningsList}
+                        ${insightsList}
+
+                        <strong>📊 Technical Features:</strong>
+                        <ul>
+                            <li>Word count: ${features.word_count || 'N/A'}</li>
+                            <li>Emoji count: ${features.emoji_count || 'N/A'}</li>
+                            <li>Bot phrases: ${features.bot_phrases || 'N/A'}</li>
+                            <li>Promotional content: ${features.promotional_words || 'N/A'}</li>
+                            <li>Has timestamp: ${features.has_timestamp ? 'Yes' : 'No'}</li>
+                        </ul>
+                    </div>
+                </div>
+            `;
+
+            resultsDiv.style.display = 'block';
+            console.log('Results displayed successfully'); // Debug line
+        }
+
+        function displayVideoResults(result) {
+            const resultsDiv = document.getElementById('results');
+
+            const engagementBars = Object.entries(result.engagement_distribution)
+                .map(([quality, count]) => {
+                    const percentage = (count / result.total_comments * 100).toFixed(1);
+                    return `<div class="metric-card">
+                        <div class="metric-value">${count}</div>
+                        <div class="metric-label">${quality} Quality (${percentage}%)</div>
+                    </div>`;
+                }).join('');
+
+            resultsDiv.innerHTML = `
+                <div class="result-card">
+                    <h3>🎬 Video Comment Analysis</h3>
+                    <div class="video-metrics">
+                        <div class="metric-card">
+                            <div class="metric-value">${result.total_comments}</div>
+                            <div class="metric-label">Total Comments</div>
+                        </div>
+                        <div class="metric-card">
+                            <div class="metric-value">${result.spam_percentage}%</div>
+                            <div class="metric-label">Spam/Bot Rate</div>
+                        </div>
+                        ${engagementBars}
+                    </div>
+                    <div class="insights">
+                        <strong>🏥 Video Health Insights:</strong>
+                        <ul>
+                            ${result.health_insights.map(insight => `<li>${insight}</li>`).join('')}
+                        </ul>
+                    </div>
+                </div>
+                <div class="result-card">
+                    <h3>📋 Individual Comment Breakdown</h3>
+                    ${result.individual_results.map((comment, index) => `
+                        <div class="result-card ${comment.spam_status.toLowerCase().replace(' ', '-').replace('/', '-')}" style="margin: 10px 0; border-left-width: 3px;">
+                            <strong>Comment ${index + 1}:</strong>
+                            <div style="margin: 8px 0;">
+                                <span class="engagement-badge ${comment.engagement_quality.toLowerCase()}">${comment.engagement_quality}</span>
+                                <span style="margin-left: 10px; font-weight: bold;">
+                                    ${comment.spam_status} (${Math.round((1-comment.spam_probability) * 100)}% authentic)
+                                </span>
+                            </div>
+                            <div style="font-size: 12px; color: #666;">
+                                ${comment.warnings.length > 0 ? '⚠️ ' + comment.warnings.slice(0, 2).join(', ') : ''}
+                                ${comment.insights.length > 0 ? '✅ ' + comment.insights.slice(0, 1).join(', ') : ''}
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+
+            resultsDiv.style.display = 'block';
+        }
+    </script>
+</body>
+</html>
+"""
+
+
+@app.route('/')
+def index():
+    """Main page - serves the YouTube comment analyzer interface"""
+    return render_template_string(HTML_TEMPLATE)
+
+
+@app.route('/analyze-comment', methods=['POST'])
+def analyze_single_comment():
+    """API endpoint for analyzing a single YouTube comment"""
+    try:
+        data = request.get_json()
+        comment_text = data.get('comment', '')
+
+        if not comment_text.strip():
+            return jsonify({'error': 'Comment text is required'}), 400
+
+        result = analyze_comment(comment_text)
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/analyze-video', methods=['POST'])
+def analyze_video_comments_endpoint():
+    """API endpoint for analyzing multiple comments from a video"""
+    try:
+        data = request.get_json()
+        comments = data.get('comments', [])
+
+        if not comments:
+            return jsonify({'error': 'At least one comment is required'}), 400
+
+        result = analyze_video_comments(comments)
+        return jsonify(result)
+
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+
+
+@app.route('/demo-comments')
+def get_demo_comments():
+    """Generate demo YouTube comments for testing"""
+    demo_comments = []
+
+    # Generate some spam comments
+    for _ in range(4):
+        comment, engagement = generate_spam_comment()
+        demo_comments.append({
+            'text': comment,
+            'likes': random.randint(0, 5),
+            'type': 'spam'
+        })
+
+    # Generate some authentic comments
+    for _ in range(6):
+        comment, engagement = generate_authentic_comment()
+        likes = random.randint(5, 50) if engagement == 'high' else random.randint(0, 10)
+        demo_comments.append({
+            'text': comment,
+            'likes': likes,
+            'type': 'authentic'
+        })
+
+    return jsonify(demo_comments)
+
+
+if __name__ == '__main__':
+    # Train AI models on startup
+    print("🤖 Training AI models for YouTube comment analysis...")
+    train_models()
+    print("✅ Models trained successfully!")
+
+    # Development server startup
+    print("\n🎬 Starting YouTube Comment Analyzer...")
+    print("📍 Available at: http://localhost:5000")
+    print("\n🚀 Features:")
+    print("  - Spam/bot detection using advanced ML + linguistic analysis")
+    print("  - Engagement quality assessment (high/medium/low)")
+    print("  - Video-level comment health analysis")
+    print("  - Real-time insights and warning detection")
+    print("  - YouTube-specific pattern recognition")
+
+    app.run(debug=True, host='0.0.0.0', port=5000)
