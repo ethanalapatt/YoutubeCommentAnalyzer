@@ -3,7 +3,7 @@
 ## Short Description
 An AI-powered web application that detects spam/bot comments and analyzes engagement quality in YouTube comments using machine learning and linguistic analysis.
 
-## 🎯 Features
+Features
 
 ### **Spam & Bot Detection**
 - **Advanced AI Models**: Gradient Boosting classifier with 90%+ accuracy
@@ -21,7 +21,7 @@ An AI-powered web application that detects spam/bot comments and analyzes engage
 1. **Single Comment Analysis**: Instant individual comment assessment
 2. **Video-Level Analysis**: Aggregate insights across multiple comments for channel health
 
-## 🧠 AI Technology
+AI Technology
 
 ### **Machine Learning Models**
 - **Spam Detector**: Gradient Boosting with 100 estimators
@@ -37,7 +37,7 @@ An AI-powered web application that detects spam/bot comments and analyzes engage
 - Generic praise vs genuine feedback
 - Scam indicators and suspicious links
 
-## 🚀 Quick Start
+##Quick Start
 
 ### Prerequisites
 ```bash
